@@ -22,7 +22,7 @@ The package exposes six modules:
 | `acpi` | `src/acpi/acpi.zig` | Serializes a declarative machine description into ACPI tables: RSDP, RSDT, FADT, MADT and a DSDT encoded from device descriptors. std-only. |
 | `fdt` | `src/fdt/fdt.zig` | Flattened device tree (DTB) serializer. std-only. |
 | `x86` | `src/x86/x86.zig` | The x86-64 architecture: `registers` (control, model-specific and CPUID bitfields), `paging` (build and walk 4-level page tables over a guest RAM slice), `mmio_decode` (the MOV behind a memory-mapped access). std-only. |
-| `linux_boot` | `src/linux_boot/linux_boot.zig` | Linux image headers and boot-protocol structures, namespaced per architecture. |
+| `linux_boot` | `src/linux_boot/linux_boot.zig` | Linux image headers and boot-protocol structures, namespaced per architecture; `x86.placement` copies a bzImage and its initramfs into guest RAM at addresses the caller gives. |
 
 ## Usage
 
