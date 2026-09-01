@@ -28,6 +28,14 @@ pub const Descriptor = struct {
     next: u16 = 0,
 };
 
+/// Receives valid guest-memory ranges resolved through `Guest`. The callback
+/// observes ranges rather than access direction because reads and writes both
+/// resolve through `Guest.slice`.
+pub const AccessTracker = struct {
+    context: *anyopaque,
+    mark: *const fn (context: *anyopaque, offset: u64, len: u64) void,
+};
+
 /// Guest RAM and the physical address it starts at.
 ///
 /// Every access is bounds-checked and answers null rather than trapping, so a
@@ -35,12 +43,14 @@ pub const Descriptor = struct {
 pub const Guest = struct {
     memory: []u8,
     base: u64,
+    access_tracker: ?AccessTracker = null,
 
     /// `len` bytes at guest physical `addr`, or null when out of range.
     pub fn slice(self: Guest, addr: u64, len: u64) ?[]u8 {
         if (addr < self.base) return null;
         const off = addr - self.base;
         if (!bits.inBounds(off, len, self.memory.len)) return null;
+        if (self.access_tracker) |tracker| tracker.mark(tracker.context, off, len);
         return self.memory[@intCast(off)..][0..@intCast(len)];
     }
 
@@ -170,6 +180,36 @@ test "guest: a write outside RAM is dropped rather than trapping" {
     const g = Guest{ .memory = &ram, .base = BASE };
     g.write(u32, BASE + 0x40, 0xffff_ffff);
     try testing.expectEqual(@as(u8, 0), ram[0]);
+}
+
+test "guest: an access tracker conservatively sees every resolved slice" {
+    const Seen = struct {
+        offset: u64 = 0,
+        len: u64 = 0,
+        calls: u32 = 0,
+
+        fn mark(context: *anyopaque, offset: u64, len: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.offset = offset;
+            self.len = len;
+            self.calls += 1;
+        }
+    };
+
+    var ram: [0x100]u8 = @splat(0);
+    var seen = Seen{};
+    const g = Guest{
+        .memory = &ram,
+        .base = BASE,
+        .access_tracker = .{ .context = &seen, .mark = Seen.mark },
+    };
+    _ = g.read(u32, BASE + 0x20);
+    try testing.expectEqual(@as(u64, 0x20), seen.offset);
+    try testing.expectEqual(@as(u64, 4), seen.len);
+    try testing.expectEqual(@as(u32, 1), seen.calls);
+
+    try testing.expectEqual(@as(?[]u8, null), g.slice(BASE + ram.len, 1));
+    try testing.expectEqual(@as(u32, 1), seen.calls);
 }
 
 test "queue: live only once the driver has set both ready and a depth" {
