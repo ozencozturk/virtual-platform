@@ -125,6 +125,17 @@ pub const SleepType = struct {
 pub const Dsdt = struct {
     devices: []const AmlDevice = &.{},
     s5: ?SleepType = null,
+    generation_id: ?GenerationId = null,
+};
+
+/// A VM Generation ID device (Microsoft's Virtual Machine Generation ID
+/// specification) under \_SB: VGEN (_HID "VMGENCTR") publishes the address of a
+/// 16-byte ID in ADDR, and a Generic Event Device, GED0 (_HID "ACPI0013"),
+/// runs Notify(\_SB.VGEN, 0x80) when its interrupt fires. The owner of the ID
+/// raises that interrupt after it changes the ID.
+pub const GenerationId = struct {
+    addr: u64, //       GPA of the 16-byte generation ID
+    event_irq: u32, //  GSI GED0 consumes (edge, active-high)
 };
 
 /// Identity stamped into the RSDP and into every table header. ACPI fixes the
@@ -359,6 +370,9 @@ const Aml = struct {
     const package_op = 0x12; //       Package(N){ elements }
     const ext_op_prefix = 0x5B; //    extended-opcode escape
     const device_op = 0x82; //        Device(NameString){ ... } — follows ext_op_prefix
+    const method_op = 0x14; //        Method(NameString, flags){ ... }
+    const notify_op = 0x86; //        Notify(SuperName, Value)
+    const dual_name_prefix = 0x2E; // two name segments follow
     const root_char = 0x5C; //        '\' root prefix in a NameString
     // Large resource-descriptor tags inside a _CRS ResourceTemplate:
     const memory32_fixed = 0x86; //   Memory32Fixed(RW, base, length)
@@ -410,6 +424,7 @@ fn encodeDsdt(dst: *Buf, d: Dsdt) void {
     b.byte(Aml.root_char); //  '\'
     b.slice("_SB_"); //        name segment
     for (d.devices) |dev| encodeDevice(&b, dev);
+    if (d.generation_id) |g| encodeGenerationId(&b, g);
     dst.byte(Aml.scope_op);
     pkgLength(dst, b.len);
     dst.slice(b.used());
@@ -489,6 +504,93 @@ fn encodeCrs(dst: *Buf, dev: AmlDevice) void {
     var s = Buf{ .data = &sz };
     integer(&s, @intCast(r.len));
 
+    dst.byte(Aml.buffer_op);
+    pkgLength(dst, s.len + r.len);
+    dst.slice(s.used());
+    dst.slice(r.used());
+}
+
+/// Encode Device(VGEN){ _HID, _UID, ADDR } and Device(GED0){ _HID, _UID, _CRS, _EVT }.
+fn encodeGenerationId(dst: *Buf, g: GenerationId) void {
+    var vgen: [64]u8 = undefined;
+    var v = Buf{ .data = &vgen };
+    v.slice("VGEN");
+    nameString(&v, "_HID", "VMGENCTR");
+    v.byte(Aml.name_op);
+    v.slice("_UID");
+    integer(&v, 0);
+    // Name(ADDR, Package(2){ low 32 bits, high 32 bits })
+    var pkg: [16]u8 = undefined;
+    var p = Buf{ .data = &pkg };
+    p.byte(2);
+    integer(&p, @truncate(g.addr));
+    integer(&p, @intCast(g.addr >> 32));
+    v.byte(Aml.name_op);
+    v.slice("ADDR");
+    v.byte(Aml.package_op);
+    pkgLength(&v, p.len);
+    v.slice(p.used());
+    deviceOf(dst, v.used());
+
+    var ged: [96]u8 = undefined;
+    var e = Buf{ .data = &ged };
+    e.slice("GED0");
+    nameString(&e, "_HID", "ACPI0013");
+    e.byte(Aml.name_op);
+    e.slice("_UID");
+    integer(&e, 0);
+    e.byte(Aml.name_op);
+    e.slice("_CRS");
+    encodeInterruptCrs(&e, g.event_irq);
+    // Method(_EVT, 1){ Notify(\_SB.VGEN, 0x80) }
+    var m: [32]u8 = undefined;
+    var mb = Buf{ .data = &m };
+    mb.slice("_EVT");
+    mb.byte(0x01); // MethodFlags: one argument, not serialized
+    mb.byte(Aml.notify_op);
+    mb.byte(Aml.root_char);
+    mb.byte(Aml.dual_name_prefix);
+    mb.slice("_SB_");
+    mb.slice("VGEN");
+    mb.byte(Aml.byte_prefix);
+    mb.byte(0x80);
+    e.byte(Aml.method_op);
+    pkgLength(&e, mb.len);
+    e.slice(mb.used());
+    deviceOf(dst, e.used());
+}
+
+/// Wrap an encoded name segment and body in Device(){ ... }.
+fn deviceOf(dst: *Buf, body: []const u8) void {
+    dst.byte(Aml.ext_op_prefix);
+    dst.byte(Aml.device_op);
+    pkgLength(dst, body.len);
+    dst.slice(body);
+}
+
+/// Emit Name(<name>, "<value>").
+fn nameString(dst: *Buf, comptime name: *const [4]u8, value: []const u8) void {
+    dst.byte(Aml.name_op);
+    dst.slice(name);
+    dst.byte(Aml.string_prefix);
+    dst.slice(value);
+    dst.byte(0x00);
+}
+
+/// Encode a _CRS value holding one Extended Interrupt (Consumer, Edge, ActiveHigh, Exclusive).
+fn encodeInterruptCrs(dst: *Buf, irq: u32) void {
+    var res: [16]u8 = undefined;
+    var r = Buf{ .data = &res };
+    r.byte(Aml.extended_interrupt);
+    r.word(0x0006);
+    r.byte((ExtIntFlags{ .consumer = true, .edge = true }).toBits());
+    r.byte(0x01); //          interrupt count
+    r.dword(irq);
+    r.byte(Aml.end_tag);
+    r.byte(0x00);
+    var sz: [8]u8 = undefined;
+    var s = Buf{ .data = &sz };
+    integer(&s, @intCast(r.len));
     dst.byte(Aml.buffer_op);
     pkgLength(dst, s.len + r.len);
     dst.slice(s.used());
@@ -803,6 +905,39 @@ test "acpi: the AML encoder threads the device window/irq into _CRS" {
     try testing.expect(std.mem.indexOf(u8, aml, &[_]u8{ 0x00, 0x00, 0xCD, 0xAB }) != null); // base
     try testing.expect(std.mem.indexOf(u8, aml, &[_]u8{ 0x00, 0x20, 0x00, 0x00 }) != null); // size
     try testing.expect(std.mem.indexOf(u8, aml, &[_]u8{ 0x09, 0x00, 0x00, 0x00 }) != null); // irq
+}
+
+test "acpi: the AML encoder emits the generation ID devices byte-for-byte" {
+    var scratch: [DSDT_AML_MAX]u8 = undefined;
+    var b = Buf{ .data = &scratch };
+    encodeGenerationId(&b, .{ .addr = 0x0000_0001_000E_F000, .event_irq = 16 });
+    const golden = [_]u8{
+        0x5B, 0x82, 0x28, 0x56, 0x47, 0x45, 0x4E, // Device(VGEN), PkgLen 40
+        0x08, 0x5F, 0x48, 0x49, 0x44, 0x0D, 0x56, 0x4D, 0x47, 0x45, 0x4E, 0x43, 0x54, 0x52, 0x00, // Name(_HID,"VMGENCTR")
+        0x08, 0x5F, 0x55, 0x49, 0x44, 0x00, //             Name(_UID, 0)
+        0x08, 0x41, 0x44, 0x44, 0x52, 0x12, 0x08, 0x02, // Name(ADDR, Package(2)
+        0x0C, 0x00, 0xF0, 0x0E, 0x00, 0x01, //             { 0xEF000, 1 })
+        0x5B, 0x82, 0x43, 0x04, 0x47, 0x45, 0x44, 0x30, // Device(GED0), PkgLen 67
+        0x08, 0x5F, 0x48, 0x49, 0x44, 0x0D, 0x41, 0x43, 0x50, 0x49, 0x30, 0x30, 0x31, 0x33, 0x00, // Name(_HID,"ACPI0013")
+        0x08, 0x5F, 0x55, 0x49, 0x44, 0x00, //             Name(_UID, 0)
+        0x08, 0x5F, 0x43, 0x52, 0x53, 0x11, 0x0E, 0x0A, 0x0B, // Name(_CRS, Buffer[11])
+        0x89, 0x06, 0x00, 0x03, 0x01, 0x10, 0x00, 0x00, 0x00, // Extended Interrupt(16)
+        0x79, 0x00, //                                     End tag
+        0x14, 0x13, 0x5F, 0x45, 0x56, 0x54, 0x01, //       Method(_EVT, 1)
+        0x86, 0x5C, 0x2E, 0x5F, 0x53, 0x42, 0x5F, 0x56, 0x47, 0x45, 0x4E, 0x0A, 0x80, // Notify(\_SB.VGEN, 0x80)
+    };
+    try testing.expectEqualSlices(u8, &golden, b.used());
+}
+
+test "acpi: the generation ID devices sit inside the \\_SB scope after the declared devices" {
+    var with: [DSDT_AML_MAX]u8 = undefined;
+    var w = Buf{ .data = &with };
+    encodeDsdt(&w, .{ .devices = TEST_DSDT.devices, .s5 = TEST_DSDT.s5, .generation_id = .{ .addr = 0xEF000, .event_irq = 16 } });
+    const aml = w.used();
+    const vgen = std.mem.indexOf(u8, aml, "VGEN").?;
+    try testing.expect(std.mem.indexOf(u8, aml, "VR00").? < vgen);
+    try testing.expect(vgen < std.mem.indexOf(u8, aml, "GED0").?);
+    try testing.expect(std.mem.indexOf(u8, aml, "GED0").? < std.mem.indexOf(u8, aml, "_S5_").?);
 }
 
 test "acpi: the MADT body encodes lapic addr, PCAT flag, and the three structures" {
