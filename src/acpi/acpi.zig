@@ -30,12 +30,13 @@ pub const RSDT_LEN = SDT_HDR + 2 * @sizeOf(u32); // header + two 32-bit table po
 pub const FADT_LEN = @sizeOf(Fadt); //             ACPI 6.0 FADT (276; revision 6)
 
 // Scratch budgets for the two encoded bodies. The writer bounds-checks every
-// append against these, so exceeding one panics rather than corrupting memory.
-// `DSDT_AML_MAX` also bounds how many devices a caller may declare; placement
-// uses the encoded length, so raising it costs stack and the reservation bound
-// below and nothing in the tables themselves.
+// append against these, and `build` returns `error.AcpiTooLarge` before writing
+// guest RAM when a description does not fit. `DSDT_AML_MAX` also bounds how many
+// devices a caller may declare; placement uses the encoded length, so raising it
+// costs stack and the reservation bound below and nothing in the tables
+// themselves.
 const MADT_BODY_MAX = 256;
-const DSDT_AML_MAX = 1024;
+const DSDT_AML_MAX = 2048;
 
 /// Upper bound on the RSDT/FADT/DSDT/MADT block.
 pub const MAX_TABLES_LEN = RSDT_LEN + FADT_LEN + (SDT_HDR + DSDT_AML_MAX) + (SDT_HDR + MADT_BODY_MAX);
@@ -97,17 +98,39 @@ pub const Madt = struct {
     entries: []const MadtEntry,
 };
 
+/// Whether a device's MMIO window accepts writes: Memory32Fixed's write-status
+/// bit. Values outside the two named ones are refused by `build`.
+pub const MemoryAccess = enum(u8) {
+    read_only = 0,
+    read_write = 1,
+    _,
+};
+
 /// One AML device object placed under \_SB: a _HID, a _UID, and a _CRS
-/// describing exactly one fixed MMIO window and one edge-triggered, active-high
-/// interrupt. A device needing a different resource shape needs the descriptor
-/// widened first.
+/// describing exactly one fixed MMIO window and, when `irq` is set, one
+/// edge-triggered, active-high interrupt. An explicit `irq = 0` is interrupt 0,
+/// not an absent one. A device needing a different resource shape needs the
+/// descriptor widened first.
 pub const AmlDevice = struct {
     name: [4]u8, //        ACPI name segment, e.g. "VR00".*
     hid: []const u8, //    _HID value, e.g. "LNRO0005"
     uid: u32 = 0,
     mmio_base: u32,
     mmio_size: u32,
-    irq: u32,
+    irq: ?u32 = null,
+    memory_access: MemoryAccess = .read_write,
+};
+
+/// Why `build` refused a description. Nothing is written to guest RAM when it
+/// returns one of these.
+pub const BuildError = error{
+    /// A table address, the RAM bound, or a 32-bit table pointer does not fit.
+    AcpiOutOfRange,
+    /// An encoded body, resource or package length exceeds its fixed budget.
+    AcpiTooLarge,
+    /// A device has an invalid name, _HID, window or access value, or two
+    /// devices in \_SB share a name (including the generation-ID devices).
+    InvalidAcpiDevice,
 };
 
 /// The sleep-type values the \_S5 object publishes — what ACPICA writes into the
@@ -183,39 +206,47 @@ pub const Params = struct {
 /// into `ram`. GPAs are direct offsets (RAM is mapped from GPA 0), so the values
 /// written into the tables are the GPAs themselves. Returns the RSDP GPA, which
 /// a boot protocol can hand to the kernel directly.
-pub fn build(ram: []u8, p: Params) !Gpa {
+///
+/// Every check runs before the first write: an error leaves `ram` unchanged.
+pub fn build(ram: []u8, p: Params) BuildError!Gpa {
+    try validateDsdt(p.dsdt);
+
     // Encode the two variable-length bodies up front, so their placed lengths are
     // known before the layout is fixed.
     var madt_scratch: [MADT_BODY_MAX]u8 = undefined;
     var mb = Buf{ .data = &madt_scratch };
-    encodeMadt(&mb, p.madt);
+    try encodeMadt(&mb, p.madt);
     const madt_body = mb.used();
 
     var aml_scratch: [DSDT_AML_MAX]u8 = undefined;
     var ab = Buf{ .data = &aml_scratch };
-    encodeDsdt(&ab, p.dsdt);
+    try encodeDsdt(&ab, p.dsdt);
     const dsdt_aml = ab.used();
 
     const dsdt_len = SDT_HDR + dsdt_aml.len;
     const madt_len = SDT_HDR + madt_body.len;
 
     // Layout: the RSDP first, then the tables back-to-back after it. Their
-    // cross-references are absolute GPAs, known before any write.
-    const rsdt_gpa = tablesGpa(p.rsdp_gpa);
-    const fadt_gpa = rsdt_gpa + RSDT_LEN;
-    const dsdt_gpa = fadt_gpa + FADT_LEN;
-    const madt_gpa = dsdt_gpa + dsdt_len;
-    const tables_end = madt_gpa + madt_len;
+    // cross-references are absolute GPAs, known before any write. The RSDT and
+    // RSDP hold 32-bit pointers, so every table must start below 4 GiB.
+    const rsdp_end = std.math.add(Gpa, p.rsdp_gpa, RSDP_LEN) catch return error.AcpiOutOfRange;
+    const rsdt_gpa = rsdp_end; // tablesGpa(p.rsdp_gpa), overflow-checked
+    const fadt_gpa = std.math.add(Gpa, rsdt_gpa, RSDT_LEN) catch return error.AcpiOutOfRange;
+    const dsdt_gpa = std.math.add(Gpa, fadt_gpa, FADT_LEN) catch return error.AcpiOutOfRange;
+    const madt_gpa = std.math.add(Gpa, dsdt_gpa, dsdt_len) catch return error.AcpiOutOfRange;
+    const tables_end = std.math.add(Gpa, madt_gpa, madt_len) catch return error.AcpiOutOfRange;
 
-    if (p.rsdp_gpa + RSDP_LEN > ram.len) return error.AcpiOutOfRange;
+    if (rsdp_end > ram.len) return error.AcpiOutOfRange;
     if (tables_end > ram.len) return error.AcpiOutOfRange;
+    if (madt_gpa > std.math.maxInt(u32)) return error.AcpiOutOfRange;
 
     // --- RSDT: a body of 32-bit pointers to the FADT and MADT ---
     {
         var rsdt_body: [2 * @sizeOf(u32)]u8 = undefined;
         var rb = Buf{ .data = &rsdt_body };
-        rb.dword(@intCast(fadt_gpa));
-        rb.dword(@intCast(madt_gpa));
+        // Two dwords into an eight-byte buffer, both pointers checked below 4 GiB.
+        rb.dword(@intCast(fadt_gpa)) catch unreachable;
+        rb.dword(@intCast(madt_gpa)) catch unreachable;
         _ = writeTable(ram, rsdt_gpa, p.oem, "RSDT", 1, rb.used());
     }
 
@@ -327,21 +358,21 @@ const IcsLocalApicNmi = extern struct { //  type 4: Local APIC NMI
 
 /// Encode the MADT body (everything after the SDT header): the Local APIC address,
 /// the MADT flags, then each interrupt-controller structure.
-fn encodeMadt(dst: *Buf, m: Madt) void {
-    dst.dword(m.lapic_addr); //                Local APIC address
-    dst.dword(if (m.pcat_compat) 1 else 0); // Flags: bit 0 = PCAT_COMPAT
+fn encodeMadt(dst: *Buf, m: Madt) Overflow!void {
+    try dst.dword(m.lapic_addr); //                Local APIC address
+    try dst.dword(if (m.pcat_compat) 1 else 0); // Flags: bit 0 = PCAT_COMPAT
     for (m.entries) |e| switch (e) {
-        .local_apic => |a| dst.slice(std.mem.asBytes(&IcsLocalApic{
+        .local_apic => |a| try dst.slice(std.mem.asBytes(&IcsLocalApic{
             .uid = a.uid,
             .apic_id = a.apic_id,
             .flags = if (a.enabled) 1 else 0, // Enabled
         })),
-        .io_apic => |a| dst.slice(std.mem.asBytes(&IcsIoApic{
+        .io_apic => |a| try dst.slice(std.mem.asBytes(&IcsIoApic{
             .id = a.id,
             .addr = a.addr,
             .gsi_base = a.gsi_base,
         })),
-        .local_apic_nmi => |a| dst.slice(std.mem.asBytes(&IcsLocalApicNmi{
+        .local_apic_nmi => |a| try dst.slice(std.mem.asBytes(&IcsLocalApicNmi{
             .uid = a.uid, //                     0xFF = all processors
             .flags = a.flags, //                 MPS INTI flags
             .lint = a.lint, //                   LINT#
@@ -415,203 +446,247 @@ comptime {
     std.debug.assert((ExtIntFlags{ .consumer = true, .edge = true }).toBits() == 0x03);
 }
 
+/// Refuse a namespace the encoder would emit wrongly: an invalid name segment,
+/// _HID or window, an unknown access value, or two siblings in \_SB sharing a
+/// name, counting the VGEN/GED0 pair the generation ID adds.
+fn validateDsdt(d: Dsdt) error{InvalidAcpiDevice}!void {
+    for (d.devices, 0..) |dev, i| {
+        if (!validNameSeg(dev.name)) return error.InvalidAcpiDevice;
+        if (!validHid(dev.hid)) return error.InvalidAcpiDevice;
+        if (dev.mmio_size == 0) return error.InvalidAcpiDevice;
+        if (@as(u64, dev.mmio_base) + dev.mmio_size > 0x1_0000_0000) return error.InvalidAcpiDevice;
+        switch (dev.memory_access) {
+            .read_only, .read_write => {},
+            _ => return error.InvalidAcpiDevice,
+        }
+        for (d.devices[0..i]) |prev| {
+            if (std.mem.eql(u8, &prev.name, &dev.name)) return error.InvalidAcpiDevice;
+        }
+        if (d.generation_id != null) {
+            if (std.mem.eql(u8, &dev.name, "VGEN") or std.mem.eql(u8, &dev.name, "GED0"))
+                return error.InvalidAcpiDevice;
+        }
+    }
+}
+
+/// An AML NameSeg: a lead character from A-Z or '_', then A-Z, 0-9 or '_'.
+fn validNameSeg(name: [4]u8) bool {
+    for (name, 0..) |c, i| {
+        const ok = (c >= 'A' and c <= 'Z') or c == '_' or (i > 0 and c >= '0' and c <= '9');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// A _HID string: nonempty printable ASCII with no space, so the NUL-terminated
+/// AML string carries it unchanged.
+fn validHid(hid: []const u8) bool {
+    if (hid.len == 0) return false;
+    for (hid) |c| if (c < 0x21 or c > 0x7E) return false;
+    return true;
+}
+
 /// Encode the whole DSDT AML body: Scope(\_SB){ devices... } followed by an
 /// optional top-level Name(\_S5, Package).
-fn encodeDsdt(dst: *Buf, d: Dsdt) void {
+fn encodeDsdt(dst: *Buf, d: Dsdt) Overflow!void {
     // Scope(\_SB) { device objects }
     var body: [DSDT_AML_MAX]u8 = undefined;
     var b = Buf{ .data = &body };
-    b.byte(Aml.root_char); //  '\'
-    b.slice("_SB_"); //        name segment
-    for (d.devices) |dev| encodeDevice(&b, dev);
-    if (d.generation_id) |g| encodeGenerationId(&b, g);
-    dst.byte(Aml.scope_op);
-    pkgLength(dst, b.len);
-    dst.slice(b.used());
+    try b.byte(Aml.root_char); //  '\'
+    try b.slice("_SB_"); //        name segment
+    for (d.devices) |dev| try encodeDevice(&b, dev);
+    if (d.generation_id) |g| try encodeGenerationId(&b, g);
+    try dst.byte(Aml.scope_op);
+    try pkgLength(dst, b.len);
+    try dst.slice(b.used());
 
     // Name(\_S5, Package(4){ SLP_TYPa, SLP_TYPb, 0, 0 }) — a sibling of the scope.
     if (d.s5) |s5| {
         var pkg: [16]u8 = undefined;
         var p = Buf{ .data = &pkg };
-        p.byte(4); //          NumElements
-        integer(&p, s5.a); //  SLP_TYPa
-        integer(&p, s5.b); //  SLP_TYPb
-        integer(&p, 0); //     reserved (spec: ignored)
-        integer(&p, 0); //     reserved
-        dst.byte(Aml.name_op);
-        dst.slice("_S5_");
-        dst.byte(Aml.package_op);
-        pkgLength(dst, p.len);
-        dst.slice(p.used());
+        try p.byte(4); //          NumElements
+        try integer(&p, s5.a); //  SLP_TYPa
+        try integer(&p, s5.b); //  SLP_TYPb
+        try integer(&p, 0); //     reserved (spec: ignored)
+        try integer(&p, 0); //     reserved
+        try dst.byte(Aml.name_op);
+        try dst.slice("_S5_");
+        try dst.byte(Aml.package_op);
+        try pkgLength(dst, p.len);
+        try dst.slice(p.used());
     }
 }
 
 /// Encode one Device(){ Name(_HID), Name(_UID), Name(_CRS) } under the enclosing
 /// scope.
-fn encodeDevice(dst: *Buf, dev: AmlDevice) void {
+fn encodeDevice(dst: *Buf, dev: AmlDevice) Overflow!void {
     var body: [256]u8 = undefined;
     var b = Buf{ .data = &body };
-    b.slice(&dev.name); //    device name segment
+    try b.slice(&dev.name); //    device name segment
 
     // Name(_HID, "<string>")
-    b.byte(Aml.name_op);
-    b.slice("_HID");
-    b.byte(Aml.string_prefix);
-    b.slice(dev.hid);
-    b.byte(0x00); //          NUL terminator
+    try b.byte(Aml.name_op);
+    try b.slice("_HID");
+    try b.byte(Aml.string_prefix);
+    try b.slice(dev.hid);
+    try b.byte(0x00); //          NUL terminator
 
     // Name(_UID, <int>)
-    b.byte(Aml.name_op);
-    b.slice("_UID");
-    integer(&b, dev.uid);
+    try b.byte(Aml.name_op);
+    try b.slice("_UID");
+    try integer(&b, dev.uid);
 
     // Name(_CRS, ResourceTemplate(){ ... })
-    b.byte(Aml.name_op);
-    b.slice("_CRS");
-    encodeCrs(&b, dev);
+    try b.byte(Aml.name_op);
+    try b.slice("_CRS");
+    try encodeCrs(&b, dev);
 
-    dst.byte(Aml.ext_op_prefix);
-    dst.byte(Aml.device_op);
-    pkgLength(dst, b.len);
-    dst.slice(b.used());
+    try dst.byte(Aml.ext_op_prefix);
+    try dst.byte(Aml.device_op);
+    try pkgLength(dst, b.len);
+    try dst.slice(b.used());
 }
 
-/// Encode a _CRS value: Buffer(){ Memory32Fixed(RW, base, size); Interrupt(irq) }.
-fn encodeCrs(dst: *Buf, dev: AmlDevice) void {
+/// Encode a _CRS value: Buffer(){ Memory32Fixed(access, base, size); and, when the
+/// device has one, Interrupt(irq) }. `validateDsdt` has already refused an access
+/// value outside the two named ones.
+fn encodeCrs(dst: *Buf, dev: AmlDevice) Overflow!void {
     // The raw resource descriptors, sized first so the Buffer length is known.
     var res: [64]u8 = undefined;
     var r = Buf{ .data = &res };
-    // Memory32Fixed(ReadWrite, base, size): tag, body length, info, base u32, len u32.
-    r.byte(Aml.memory32_fixed);
-    r.word(0x0009);
-    r.byte((Memory32Flags{ .write_ok = true }).toBits());
-    r.dword(dev.mmio_base);
-    r.dword(dev.mmio_size);
+    // Memory32Fixed(access, base, size): tag, body length, info, base u32, len u32.
+    try r.byte(Aml.memory32_fixed);
+    try r.word(0x0009);
+    try r.byte((Memory32Flags{ .write_ok = dev.memory_access == .read_write }).toBits());
+    try r.dword(dev.mmio_base);
+    try r.dword(dev.mmio_size);
     // Extended Interrupt(Consumer, Edge, ActiveHigh, Exclusive, count=1, irq).
     // active_low/shared stay clear ⇒ active-high, exclusive — matching the MADT's
     // MpsIntiFlags for the same line and the ioapic model's edge delivery.
-    r.byte(Aml.extended_interrupt);
-    r.word(0x0006);
-    r.byte((ExtIntFlags{ .consumer = true, .edge = true }).toBits());
-    r.byte(0x01); //          interrupt count
-    r.dword(dev.irq);
+    if (dev.irq) |irq| {
+        try r.byte(Aml.extended_interrupt);
+        try r.word(0x0006);
+        try r.byte((ExtIntFlags{ .consumer = true, .edge = true }).toBits());
+        try r.byte(0x01); //          interrupt count
+        try r.dword(irq);
+    }
     // End tag + checksum(0).
-    r.byte(Aml.end_tag);
-    r.byte(0x00);
+    try r.byte(Aml.end_tag);
+    try r.byte(0x00);
 
     // Buffer: BufferOp, PkgLength, BufferSize(integer = resource byte count), bytes.
     var sz: [8]u8 = undefined;
     var s = Buf{ .data = &sz };
-    integer(&s, @intCast(r.len));
+    try integer(&s, @intCast(r.len));
 
-    dst.byte(Aml.buffer_op);
-    pkgLength(dst, s.len + r.len);
-    dst.slice(s.used());
-    dst.slice(r.used());
+    try dst.byte(Aml.buffer_op);
+    try pkgLength(dst, s.len + r.len);
+    try dst.slice(s.used());
+    try dst.slice(r.used());
 }
 
 /// Encode Device(VGEN){ _HID, _UID, ADDR } and Device(GED0){ _HID, _UID, _CRS, _EVT }.
-fn encodeGenerationId(dst: *Buf, g: GenerationId) void {
+fn encodeGenerationId(dst: *Buf, g: GenerationId) Overflow!void {
     var vgen: [64]u8 = undefined;
     var v = Buf{ .data = &vgen };
-    v.slice("VGEN");
-    nameString(&v, "_HID", "VMGENCTR");
-    v.byte(Aml.name_op);
-    v.slice("_UID");
-    integer(&v, 0);
+    try v.slice("VGEN");
+    try nameString(&v, "_HID", "VMGENCTR");
+    try v.byte(Aml.name_op);
+    try v.slice("_UID");
+    try integer(&v, 0);
     // Name(ADDR, Package(2){ low 32 bits, high 32 bits })
     var pkg: [16]u8 = undefined;
     var p = Buf{ .data = &pkg };
-    p.byte(2);
-    integer(&p, @truncate(g.addr));
-    integer(&p, @intCast(g.addr >> 32));
-    v.byte(Aml.name_op);
-    v.slice("ADDR");
-    v.byte(Aml.package_op);
-    pkgLength(&v, p.len);
-    v.slice(p.used());
-    deviceOf(dst, v.used());
+    try p.byte(2);
+    try integer(&p, @truncate(g.addr));
+    try integer(&p, @intCast(g.addr >> 32));
+    try v.byte(Aml.name_op);
+    try v.slice("ADDR");
+    try v.byte(Aml.package_op);
+    try pkgLength(&v, p.len);
+    try v.slice(p.used());
+    try deviceOf(dst, v.used());
 
     var ged: [96]u8 = undefined;
     var e = Buf{ .data = &ged };
-    e.slice("GED0");
-    nameString(&e, "_HID", "ACPI0013");
-    e.byte(Aml.name_op);
-    e.slice("_UID");
-    integer(&e, 0);
-    e.byte(Aml.name_op);
-    e.slice("_CRS");
-    encodeInterruptCrs(&e, g.event_irq);
+    try e.slice("GED0");
+    try nameString(&e, "_HID", "ACPI0013");
+    try e.byte(Aml.name_op);
+    try e.slice("_UID");
+    try integer(&e, 0);
+    try e.byte(Aml.name_op);
+    try e.slice("_CRS");
+    try encodeInterruptCrs(&e, g.event_irq);
     // Method(_EVT, 1){ Notify(\_SB.VGEN, 0x80) }
     var m: [32]u8 = undefined;
     var mb = Buf{ .data = &m };
-    mb.slice("_EVT");
-    mb.byte(0x01); // MethodFlags: one argument, not serialized
-    mb.byte(Aml.notify_op);
-    mb.byte(Aml.root_char);
-    mb.byte(Aml.dual_name_prefix);
-    mb.slice("_SB_");
-    mb.slice("VGEN");
-    mb.byte(Aml.byte_prefix);
-    mb.byte(0x80);
-    e.byte(Aml.method_op);
-    pkgLength(&e, mb.len);
-    e.slice(mb.used());
-    deviceOf(dst, e.used());
+    try mb.slice("_EVT");
+    try mb.byte(0x01); // MethodFlags: one argument, not serialized
+    try mb.byte(Aml.notify_op);
+    try mb.byte(Aml.root_char);
+    try mb.byte(Aml.dual_name_prefix);
+    try mb.slice("_SB_");
+    try mb.slice("VGEN");
+    try mb.byte(Aml.byte_prefix);
+    try mb.byte(0x80);
+    try e.byte(Aml.method_op);
+    try pkgLength(&e, mb.len);
+    try e.slice(mb.used());
+    try deviceOf(dst, e.used());
 }
 
 /// Wrap an encoded name segment and body in Device(){ ... }.
-fn deviceOf(dst: *Buf, body: []const u8) void {
-    dst.byte(Aml.ext_op_prefix);
-    dst.byte(Aml.device_op);
-    pkgLength(dst, body.len);
-    dst.slice(body);
+fn deviceOf(dst: *Buf, body: []const u8) Overflow!void {
+    try dst.byte(Aml.ext_op_prefix);
+    try dst.byte(Aml.device_op);
+    try pkgLength(dst, body.len);
+    try dst.slice(body);
 }
 
 /// Emit Name(<name>, "<value>").
-fn nameString(dst: *Buf, comptime name: *const [4]u8, value: []const u8) void {
-    dst.byte(Aml.name_op);
-    dst.slice(name);
-    dst.byte(Aml.string_prefix);
-    dst.slice(value);
-    dst.byte(0x00);
+fn nameString(dst: *Buf, comptime name: *const [4]u8, value: []const u8) Overflow!void {
+    try dst.byte(Aml.name_op);
+    try dst.slice(name);
+    try dst.byte(Aml.string_prefix);
+    try dst.slice(value);
+    try dst.byte(0x00);
 }
 
 /// Encode a _CRS value holding one Extended Interrupt (Consumer, Edge, ActiveHigh, Exclusive).
-fn encodeInterruptCrs(dst: *Buf, irq: u32) void {
+fn encodeInterruptCrs(dst: *Buf, irq: u32) Overflow!void {
     var res: [16]u8 = undefined;
     var r = Buf{ .data = &res };
-    r.byte(Aml.extended_interrupt);
-    r.word(0x0006);
-    r.byte((ExtIntFlags{ .consumer = true, .edge = true }).toBits());
-    r.byte(0x01); //          interrupt count
-    r.dword(irq);
-    r.byte(Aml.end_tag);
-    r.byte(0x00);
+    try r.byte(Aml.extended_interrupt);
+    try r.word(0x0006);
+    try r.byte((ExtIntFlags{ .consumer = true, .edge = true }).toBits());
+    try r.byte(0x01); //          interrupt count
+    try r.dword(irq);
+    try r.byte(Aml.end_tag);
+    try r.byte(0x00);
     var sz: [8]u8 = undefined;
     var s = Buf{ .data = &sz };
-    integer(&s, @intCast(r.len));
-    dst.byte(Aml.buffer_op);
-    pkgLength(dst, s.len + r.len);
-    dst.slice(s.used());
-    dst.slice(r.used());
+    try integer(&s, @intCast(r.len));
+    try dst.byte(Aml.buffer_op);
+    try pkgLength(dst, s.len + r.len);
+    try dst.slice(s.used());
+    try dst.slice(r.used());
 }
 
 /// Emit an AML integer term with the smallest opcode that fits.
-fn integer(dst: *Buf, v: u32) void {
+fn integer(dst: *Buf, v: u32) Overflow!void {
     switch (v) {
-        0 => dst.byte(Aml.zero),
-        1 => dst.byte(Aml.one),
+        0 => try dst.byte(Aml.zero),
+        1 => try dst.byte(Aml.one),
         else => {
             if (v <= 0xFF) {
-                dst.byte(Aml.byte_prefix);
-                dst.byte(@intCast(v));
+                try dst.byte(Aml.byte_prefix);
+                try dst.byte(@intCast(v));
             } else if (v <= 0xFFFF) {
-                dst.byte(Aml.word_prefix);
-                dst.word(@intCast(v));
+                try dst.byte(Aml.word_prefix);
+                try dst.word(@intCast(v));
             } else {
-                dst.byte(Aml.dword_prefix);
-                dst.dword(v);
+                try dst.byte(Aml.dword_prefix);
+                try dst.dword(v);
             }
         },
     }
@@ -619,40 +694,46 @@ fn integer(dst: *Buf, v: u32) void {
 
 /// Emit a minimal AML PkgLength for a package whose content (everything after the
 /// PkgLength field) is `content_len` bytes. The encoded length counts itself.
-fn pkgLength(dst: *Buf, content_len: usize) void {
+fn pkgLength(dst: *Buf, content_len: usize) Overflow!void {
     if (content_len + 1 <= 0x3F) {
-        dst.byte(@intCast(content_len + 1)); //   1-byte form (lead bits 6-7 = 0)
+        try dst.byte(@intCast(content_len + 1)); //   1-byte form (lead bits 6-7 = 0)
     } else {
         const total = content_len + 2;
-        std.debug.assert(total <= 0xFFF);
-        dst.byte(@intCast(0x40 | (total & 0x0F))); // 1 follow byte
-        dst.byte(@intCast((total >> 4) & 0xFF));
+        if (total > 0xFFF) return error.AcpiTooLarge;
+        try dst.byte(@intCast(0x40 | (total & 0x0F))); // 1 follow byte
+        try dst.byte(@intCast((total >> 4) & 0xFF));
     }
 }
 
 // ---- little-endian append writer -------------------------------------------
 
+/// An encoded body that would not fit its fixed scratch buffer.
+const Overflow = error{AcpiTooLarge};
+
 const Buf = struct {
     data: []u8,
     len: usize = 0,
 
-    fn byte(self: *Buf, b: u8) void {
-        std.debug.assert(self.len + 1 <= self.data.len);
+    fn room(self: *const Buf, n: usize) Overflow!void {
+        if (n > self.data.len - self.len) return error.AcpiTooLarge;
+    }
+    fn byte(self: *Buf, b: u8) Overflow!void {
+        try self.room(1);
         self.data[self.len] = b;
         self.len += 1;
     }
-    fn slice(self: *Buf, s: []const u8) void {
-        std.debug.assert(self.len + s.len <= self.data.len);
+    fn slice(self: *Buf, s: []const u8) Overflow!void {
+        try self.room(s.len);
         @memcpy(self.data[self.len..][0..s.len], s);
         self.len += s.len;
     }
-    fn word(self: *Buf, v: u16) void {
-        std.debug.assert(self.len + 2 <= self.data.len);
+    fn word(self: *Buf, v: u16) Overflow!void {
+        try self.room(2);
         std.mem.writeInt(u16, self.data[self.len..][0..2], v, .little);
         self.len += 2;
     }
-    fn dword(self: *Buf, v: u32) void {
-        std.debug.assert(self.len + 4 <= self.data.len);
+    fn dword(self: *Buf, v: u32) Overflow!void {
+        try self.room(4);
         std.mem.writeInt(u32, self.data[self.len..][0..4], v, .little);
         self.len += 4;
     }
@@ -889,14 +970,14 @@ const MADT_GPA: Gpa = DSDT_GPA + DSDT_LEN;
 test "acpi: the AML encoder reproduces the golden DSDT byte-for-byte" {
     var scratch: [DSDT_AML_MAX]u8 = undefined;
     var b = Buf{ .data = &scratch };
-    encodeDsdt(&b, TEST_DSDT);
+    try encodeDsdt(&b, TEST_DSDT);
     try testing.expectEqualSlices(u8, &GOLDEN_DSDT_AML, b.used());
 }
 
 test "acpi: the AML encoder threads the device window/irq into _CRS" {
     var scratch: [DSDT_AML_MAX]u8 = undefined;
     var b = Buf{ .data = &scratch };
-    encodeDsdt(&b, .{ .devices = &.{
+    try encodeDsdt(&b, .{ .devices = &.{
         .{ .name = "VR00".*, .hid = "LNRO0005", .mmio_base = 0xABCD_0000, .mmio_size = 0x2000, .irq = 9 },
     }, .s5 = .{ .a = 7, .b = 7 } });
     const aml = b.used();
@@ -910,7 +991,7 @@ test "acpi: the AML encoder threads the device window/irq into _CRS" {
 test "acpi: the AML encoder emits the generation ID devices byte-for-byte" {
     var scratch: [DSDT_AML_MAX]u8 = undefined;
     var b = Buf{ .data = &scratch };
-    encodeGenerationId(&b, .{ .addr = 0x0000_0001_000E_F000, .event_irq = 16 });
+    try encodeGenerationId(&b, .{ .addr = 0x0000_0001_000E_F000, .event_irq = 16 });
     const golden = [_]u8{
         0x5B, 0x82, 0x28, 0x56, 0x47, 0x45, 0x4E, // Device(VGEN), PkgLen 40
         0x08, 0x5F, 0x48, 0x49, 0x44, 0x0D, 0x56, 0x4D, 0x47, 0x45, 0x4E, 0x43, 0x54, 0x52, 0x00, // Name(_HID,"VMGENCTR")
@@ -932,7 +1013,7 @@ test "acpi: the AML encoder emits the generation ID devices byte-for-byte" {
 test "acpi: the generation ID devices sit inside the \\_SB scope after the declared devices" {
     var with: [DSDT_AML_MAX]u8 = undefined;
     var w = Buf{ .data = &with };
-    encodeDsdt(&w, .{ .devices = TEST_DSDT.devices, .s5 = TEST_DSDT.s5, .generation_id = .{ .addr = 0xEF000, .event_irq = 16 } });
+    try encodeDsdt(&w, .{ .devices = TEST_DSDT.devices, .s5 = TEST_DSDT.s5, .generation_id = .{ .addr = 0xEF000, .event_irq = 16 } });
     const aml = w.used();
     const vgen = std.mem.indexOf(u8, aml, "VGEN").?;
     try testing.expect(std.mem.indexOf(u8, aml, "VR00").? < vgen);
@@ -943,7 +1024,7 @@ test "acpi: the generation ID devices sit inside the \\_SB scope after the decla
 test "acpi: the MADT body encodes lapic addr, PCAT flag, and the three structures" {
     var scratch: [MADT_BODY_MAX]u8 = undefined;
     var b = Buf{ .data = &scratch };
-    encodeMadt(&b, TEST_MADT);
+    try encodeMadt(&b, TEST_MADT);
     const m = b.used();
     try testing.expectEqual(@as(usize, 8 + 8 + 12 + 6), m.len);
     try testing.expectEqual(@as(u32, 0xFEE0_0000), std.mem.readInt(u32, m[0..4], .little));
@@ -1096,4 +1177,127 @@ test "acpi: rejects placement past the end of RAM" {
         .madt = TEST_MADT,
         .dsdt = TEST_DSDT,
     }));
+}
+
+// A device shaped like a read-only MMIO endpoint: no interrupt, ReadOnly window.
+const RO_DEVICE = AmlDevice{ .name = "RE00".*, .hid = "VMMR0001", .uid = 1, .mmio_base = 0xD000_9000, .mmio_size = 0x2_0000, .memory_access = .read_only };
+
+fn expectRefusedUnchanged(expected: BuildError, d: Dsdt, rsdp_gpa: Gpa) !void {
+    const ram = try testing.allocator.alloc(u8, 0x10_0000);
+    defer testing.allocator.free(ram);
+    @memset(ram, 0xAA);
+    try testing.expectError(expected, build(ram, .{ .rsdp_gpa = rsdp_gpa, .oem = TEST_OEM, .madt = TEST_MADT, .dsdt = d }));
+    for (ram) |b| try testing.expectEqual(@as(u8, 0xAA), b);
+}
+
+test "acpi: an IRQ-less read-only device emits Memory32Fixed(ReadOnly) and no interrupt" {
+    var scratch: [DSDT_AML_MAX]u8 = undefined;
+    var b = Buf{ .data = &scratch };
+    try encodeDsdt(&b, .{ .devices = &.{RO_DEVICE} });
+    const crs = [_]u8{
+        0x08, 0x5F, 0x43, 0x52, 0x53, 0x11, 0x11, 0x0A, 0x0E, // Name(_CRS, Buffer[14])
+        0x86, 0x09, 0x00, 0x00, 0x00, 0x90, 0x00, 0xD0, 0x00, 0x00, 0x02, 0x00, // Memory32Fixed(ReadOnly)
+        0x79, 0x00, //                                     End tag
+    };
+    const aml = b.used();
+    try testing.expect(std.mem.endsWith(u8, aml, &crs));
+    try testing.expect(std.mem.indexOfScalar(u8, aml, 0x89) == null); // no Extended Interrupt
+}
+
+test "acpi: an explicit IRQ 0 is an interrupt, not an absent one" {
+    var scratch: [DSDT_AML_MAX]u8 = undefined;
+    var b = Buf{ .data = &scratch };
+    var dev = RO_DEVICE;
+    dev.irq = 0;
+    try encodeDsdt(&b, .{ .devices = &.{dev} });
+    try testing.expect(std.mem.indexOf(u8, b.used(), &[_]u8{ 0x89, 0x06, 0x00, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00 }) != null);
+}
+
+test "acpi: build refuses invalid devices before writing RAM" {
+    const gen = GenerationId{ .addr = 0xEF000, .event_irq = 16 };
+    var bad = RO_DEVICE;
+    try expectRefusedUnchanged(error.InvalidAcpiDevice, .{ .devices = &.{ RO_DEVICE, RO_DEVICE } }, RSDP_GPA);
+    bad.name = "VGEN".*;
+    try expectRefusedUnchanged(error.InvalidAcpiDevice, .{ .devices = &.{bad}, .generation_id = gen }, RSDP_GPA);
+    bad.name = "GED0".*;
+    try expectRefusedUnchanged(error.InvalidAcpiDevice, .{ .devices = &.{bad}, .generation_id = gen }, RSDP_GPA);
+    bad.name = "0BAD".*;
+    try expectRefusedUnchanged(error.InvalidAcpiDevice, .{ .devices = &.{bad} }, RSDP_GPA);
+    bad.name = "Re00".*;
+    try expectRefusedUnchanged(error.InvalidAcpiDevice, .{ .devices = &.{bad} }, RSDP_GPA);
+    bad = RO_DEVICE;
+    bad.hid = "";
+    try expectRefusedUnchanged(error.InvalidAcpiDevice, .{ .devices = &.{bad} }, RSDP_GPA);
+    bad.hid = "VMM R001";
+    try expectRefusedUnchanged(error.InvalidAcpiDevice, .{ .devices = &.{bad} }, RSDP_GPA);
+    bad = RO_DEVICE;
+    bad.mmio_size = 0;
+    try expectRefusedUnchanged(error.InvalidAcpiDevice, .{ .devices = &.{bad} }, RSDP_GPA);
+    bad = RO_DEVICE;
+    bad.mmio_base = 0xFFFF_F000;
+    bad.mmio_size = 0x2000;
+    try expectRefusedUnchanged(error.InvalidAcpiDevice, .{ .devices = &.{bad} }, RSDP_GPA);
+    bad = RO_DEVICE;
+    bad.memory_access = @enumFromInt(2);
+    try expectRefusedUnchanged(error.InvalidAcpiDevice, .{ .devices = &.{bad} }, RSDP_GPA);
+}
+
+test "acpi: VGEN and GED0 are ordinary names without a generation ID" {
+    var named = RO_DEVICE;
+    named.name = "VGEN".*;
+    var scratch: [DSDT_AML_MAX]u8 = undefined;
+    var b = Buf{ .data = &scratch };
+    try validateDsdt(.{ .devices = &.{named} });
+    try encodeDsdt(&b, .{ .devices = &.{named} });
+}
+
+test "acpi: a window ending exactly at 4 GiB is representable" {
+    var top = RO_DEVICE;
+    top.mmio_base = 0xFFFF_F000;
+    top.mmio_size = 0x1000;
+    try validateDsdt(.{ .devices = &.{top} });
+}
+
+test "acpi: build refuses an oversized description with AcpiTooLarge before writing RAM" {
+    const long_hid: [300]u8 = @splat('A');
+    var big = RO_DEVICE;
+    big.hid = &long_hid;
+    try expectRefusedUnchanged(error.AcpiTooLarge, .{ .devices = &.{big} }, RSDP_GPA);
+}
+
+test "acpi: build refuses table addresses that overflow" {
+    try expectRefusedUnchanged(error.AcpiOutOfRange, TEST_DSDT, std.math.maxInt(Gpa) - 4);
+}
+
+test "acpi: nine virtio nodes, eight endpoints and the generation ID fit the DSDT budget" {
+    var devices: [17]AmlDevice = undefined;
+    for (devices[0..9], 0..) |*d, i| d.* = .{
+        .name = .{ 'V', 'R', '0', '0' + @as(u8, @intCast(i)) },
+        .hid = "LNRO0005",
+        .mmio_base = 0xD000_0000 + @as(u32, @intCast(i)) * 0x1000,
+        .mmio_size = 0x1000,
+        .irq = 5 + @as(u32, @intCast(i)),
+    };
+    for (devices[9..], 0..) |*d, i| d.* = .{
+        .name = .{ 'R', 'E', '0', '0' + @as(u8, @intCast(i)) },
+        .hid = "VMMR0001",
+        .uid = std.math.maxInt(u32) - @as(u32, @intCast(i)),
+        .mmio_base = 0xD000_9000 + @as(u32, @intCast(i)) * 0x2_0000,
+        .mmio_size = 0x2_0000,
+        .memory_access = .read_only,
+    };
+    const ram = try testing.allocator.alloc(u8, 0x10_0000);
+    defer testing.allocator.free(ram);
+    @memset(ram, 0);
+    const rsdp = try build(ram, .{
+        .rsdp_gpa = RSDP_GPA,
+        .oem = TEST_OEM,
+        .madt = TEST_MADT,
+        .dsdt = .{ .devices = &devices, .s5 = .{ .a = 5, .b = 5 }, .generation_id = .{ .addr = 0xEF000, .event_irq = 16 } },
+    });
+    try testing.expectEqual(RSDP_GPA, rsdp);
+    const dsdt = ram[@intCast(DSDT_GPA)..];
+    const len = std.mem.readInt(u32, dsdt[4..8], .little);
+    try testing.expect(len - SDT_HDR <= DSDT_AML_MAX);
+    try testing.expect(sums0(dsdt[0..len]));
 }
